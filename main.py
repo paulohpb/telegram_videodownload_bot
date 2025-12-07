@@ -14,9 +14,9 @@ class MediaFixBot:
     def __init__(self):
         self.config = Config()
         # Connect to Telegram
-        # API_ID may be stored as a string in the environment; ensure int()
+        # API_ID is already an int from Config, API_HASH is already a string
         client = TelegramClient(
-            'media_fix_bot', int(self.config.API_ID), str(self.config.API_HASH)
+            'media_fix_bot', self.config.API_ID, self.config.API_HASH
         )
         # Start the client as a bot using the provided token
         client.start(bot_token=self.config.BOT_TOKEN)
