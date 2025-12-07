@@ -9,16 +9,21 @@ from utils.video_compressor import shutdown_executor
 
 logger = setup_logger()
 
+
 class MediaFixBot:
     def __init__(self):
-        self.config = Config()
-        # Connect to Telegram
-        self.client = TelegramClient('media_fix_bot', self.config.API_ID, self.config.API_HASH)
-        self.client.start(bot_token=self.config.BOT_TOKEN)
-        
-        self.queue_manager = DownloadQueueManager(max_concurrent=2)
-        self.service_factory = ServiceFactory()
-        self._shutdown_event = asyncio.Event()
+    self.config = Config()
+    # Connect to Telegram
+    # API_ID may be stored as a string in the environment; ensure int()
+    self.client = TelegramClient(
+        'media_fix_bot', int(self.config.API_ID), str(self.config.API_HASH)
+    )
+    # Start the client as a bot using the provided token
+    self.client.start(bot_token=self.config.BOT_TOKEN)
+
+    self.queue_manager = DownloadQueueManager(max_concurrent=2)
+    self.service_factory = ServiceFactory()
+    self._shutdown_event = asyncio.Event()
 
     async def start(self) -> None:
         await self.queue_manager.start(self.client)
@@ -47,4 +52,8 @@ if __name__ == '__main__':
     # Start async setup (handlers, queue manager, etc.)
     bot.client.loop.run_until_complete(bot.start())
     # Block the thread until the client disconnects (synchronous)
+<<<<<<< HEAD
     bot.client.run_until_disconnected()
+=======
+    bot.client.run_until_disconnected()
+>>>>>>> origin/main

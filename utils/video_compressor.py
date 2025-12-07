@@ -98,16 +98,18 @@ class VideoCompressor:
             output_path,
             self.MAX_SIZE_BYTES
         )
-        
-        if not success:
-            logger.error(f"Compression failed: {message}")
-            raise RuntimeError(f"Video compression failed: {message}")
-        
-        return output_path, True
 
-def shutdown_executor() -> None:
+        if success:
+            logger.info(message)
+            return output_path, True
+        else:
+            logger.error(f"Compression failed: {message}")
+            return input_path, False
+
+
+def shutdown_executor():
+    """Cleanup: shutdown the process pool executor."""
     global _ffmpeg_executor
-    if _ffmpeg_executor is not None:
+    if _ffmpeg_executor:
         _ffmpeg_executor.shutdown(wait=True)
         _ffmpeg_executor = None
-        logger.info("FFmpeg executor shutdown complete")
