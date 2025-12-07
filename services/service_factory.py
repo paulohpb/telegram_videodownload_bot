@@ -1,6 +1,7 @@
 import asyncio
 from typing import Optional, Any
 from utils.logger import setup_logger
+from services.youtube_service import YoutubeService
 
 logger = setup_logger()
 
@@ -32,8 +33,35 @@ class MockService:
         }
 
 class ServiceFactory:
+    def __init__(self):
+        """Initialize service factory with all available services."""
+        self.youtube_service = YoutubeService()
+    
     def get_service_for_url(self, text: str) -> Optional[Any]:
+        """
+        Detect service type from URL and return appropriate service.
+        
+        Args:
+            text: Text that may contain a URL
+            
+        Returns:
+            Service instance (YoutubeService, MockService, or None)
+        """
+        # Check for YouTube URLs first
+        if self.youtube_service.extract_url(text):
+            return self.youtube_service
+        
         # Return our mock service if the URL looks like a test URL
         if "test.com" in text:
             return MockService()
+        
         return None
+    
+    def shutdown(self) -> None:
+        """
+        Shutdown all services.
+        
+        Should be called when the bot is shutting down.
+        """
+        if self.youtube_service:
+            self.youtube_service.shutdown()

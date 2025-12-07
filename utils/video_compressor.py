@@ -35,13 +35,39 @@ def _get_executor() -> ProcessPoolExecutor:
 def _get_duration_sync(input_path: str) -> float:
     """
     Get video duration synchronously using ffprobe.
+    
     Args:
         input_path: Path to the video file.
+        
     Returns:
         Duration in seconds, or 0 if unable to determine.
     """
-    # Mock duration for testing if ffprobe fails/missing
-    return 60.0
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1:noprint_wrappers=1",
+            input_path
+        ]
+        
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10
+        )
+        
+        if result.returncode == 0:
+            duration = float(result.stdout.decode().strip())
+            return duration
+        else:
+            logger.warning(f"ffprobe failed for {input_path}: {result.stderr.decode()}")
+            return 0.0
+            
+    except (subprocess.TimeoutExpired, ValueError, FileNotFoundError) as e:
+        logger.warning(f"Error getting duration for {input_path}: {str(e)}")
+        return 0.0
 
 
 def _compress_video_sync(
@@ -50,20 +76,133 @@ def _compress_video_sync(
     max_size_bytes: int
 ) -> Tuple[bool, str]:
     """
-    Perform video compression synchronously in a separate process.
-    """
-    import time
-    # MOCKING COMPRESSION FOR TESTING
-    # Real compression takes time, so we sleep to simulate CPU work
-    # This proves the ProcessPoolExecutor is working if the bot stays responsive.
-    print(f"DEBUG: Starting compression on PID {os.getpid()}")
-    time.sleep(5) 
+    Compress video using ffmpeg two-pass encoding to achieve target file size.
     
-    # Create a dummy compressed file (smaller size)
-    with open(output_path, 'wb') as f:
-        f.write(b'0' * (10 * 1024 * 1024)) # 10MB
+    Calculates bitrate based on video duration to fit within max_size_bytes,
+    targeting 95% of the limit for safety margin.
+    
+    Args:
+        input_path: Path to the input video file
+        output_path: Path for the compressed output file
+        max_size_bytes: Maximum target file size in bytes
         
-    return True, "Compression completed successfully (Simulated)"
+    Returns:
+        Tuple of (success: bool, message: str)
+    """
+    TIMEOUT_SECONDS = 300  # 5 minutes
+    AUDIO_BITRATE_KBPS = 128
+    TARGET_SIZE_RATIO = 0.95
+    
+    try:
+        # Get video duration using existing helper
+        duration = _get_duration_sync(input_path)
+        if duration <= 0:
+            return False, "Invalid video duration (must be > 0)"
+        
+        # Calculate target bitrate to fit within size limit
+        # Formula: bitrate (kbps) = (size_bytes * 8 / 1000) / duration_seconds
+        target_size_bytes = max_size_bytes * TARGET_SIZE_RATIO
+        target_size_kbits = (target_size_bytes * 8) / 1000
+        total_bitrate_kbps = target_size_kbits / duration
+        
+        # Subtract audio bitrate to get video bitrate
+        video_bitrate_kbps = total_bitrate_kbps - AUDIO_BITRATE_KBPS
+        
+        if video_bitrate_kbps <= 0:
+            return False, (
+                f"Video too long for target size. "
+                f"Required video bitrate would be {video_bitrate_kbps:.2f}kbps"
+            )
+        
+        video_bitrate = f"{int(video_bitrate_kbps)}k"
+        audio_bitrate = f"{AUDIO_BITRATE_KBPS}k"
+        
+        # Use temp directory for two-pass log files
+        with tempfile.TemporaryDirectory() as temp_dir:
+            passlogfile = os.path.join(temp_dir, "ffmpeg2pass")
+            
+            # Null device for pass 1 output (OS-dependent)
+            null_device = "/dev/null" if os.name != "nt" else "NUL"
+            
+            # ============== Pass 1: Analyze video ==============
+            pass1_cmd = [
+                "ffmpeg",
+                "-y",                       # Overwrite without asking
+                "-i", input_path,           # Input file
+                "-c:v", "libx264",          # H.264 codec
+                "-b:v", video_bitrate,      # Target video bitrate
+                "-pass", "1",               # First pass
+                "-passlogfile", passlogfile,
+                "-an",                      # No audio for first pass
+                "-f", "null",               # Null output format
+                null_device                 # Discard output
+            ]
+            
+            process = subprocess.Popen(
+                pass1_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            try:
+                _, stderr = process.communicate(timeout=TIMEOUT_SECONDS)
+                if process.returncode != 0:
+                    return False, f"FFmpeg pass 1 failed: {stderr.decode(errors='replace')}"
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                return False, "Compression timed out during pass 1"
+            
+            # ============== Pass 2: Encode with target bitrate ==============
+            pass2_cmd = [
+                "ffmpeg",
+                "-y",                       # Overwrite without asking
+                "-i", input_path,           # Input file
+                "-c:v", "libx264",          # H.264 codec
+                "-b:v", video_bitrate,      # Target video bitrate
+                "-pass", "2",               # Second pass
+                "-passlogfile", passlogfile,
+                "-c:a", "aac",              # AAC audio codec
+                "-b:a", audio_bitrate,      # Audio bitrate 128k
+                output_path                 # Output file
+            ]
+            
+            process = subprocess.Popen(
+                pass2_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            try:
+                _, stderr = process.communicate(timeout=TIMEOUT_SECONDS)
+                if process.returncode != 0:
+                    return False, f"FFmpeg pass 2 failed: {stderr.decode(errors='replace')}"
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                # Clean up partial output file if it exists
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                return False, "Compression timed out during pass 2"
+        
+        # Verify output file was created
+        if os.path.exists(output_path):
+            output_size = os.path.getsize(output_path)
+            return True, (
+                f"Compression completed successfully. "
+                f"Output size: {output_size / (1024 * 1024):.2f}MB"
+            )
+        else:
+            return False, "Output file was not created"
+            
+    except Exception as e:
+        # Clean up output file on error
+        try:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        except OSError:
+            pass
+        return False, f"Compression error: {str(e)}"
 
 
 class VideoCompressor:

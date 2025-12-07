@@ -12,18 +12,19 @@ logger = setup_logger()
 
 class MediaFixBot:
     def __init__(self):
-    self.config = Config()
-    # Connect to Telegram
-    # API_ID may be stored as a string in the environment; ensure int()
-    self.client = TelegramClient(
-        'media_fix_bot', int(self.config.API_ID), str(self.config.API_HASH)
-    )
-    # Start the client as a bot using the provided token
-    self.client.start(bot_token=self.config.BOT_TOKEN)
+        self.config = Config()
+        # Connect to Telegram
+        # API_ID may be stored as a string in the environment; ensure int()
+        client = TelegramClient(
+            'media_fix_bot', int(self.config.API_ID), str(self.config.API_HASH)
+        )
+        # Start the client as a bot using the provided token
+        client.start(bot_token=self.config.BOT_TOKEN)
+        self.client = client
 
-    self.queue_manager = DownloadQueueManager(max_concurrent=2)
-    self.service_factory = ServiceFactory()
-    self._shutdown_event = asyncio.Event()
+        self.queue_manager = DownloadQueueManager(max_concurrent=2)
+        self.service_factory = ServiceFactory()
+        self._shutdown_event = asyncio.Event()
 
     async def start(self) -> None:
         await self.queue_manager.start(self.client)
@@ -32,17 +33,21 @@ class MediaFixBot:
         async def handle_message(event):
             try:
                 if not event.message.text: return
-                # Check if it's our mock test URL
+                
+                # Check if service can handle this URL
                 service = self.service_factory.get_service_for_url(event.message.text)
                 if service:
-                    logger.info("Test URL detected!")
-                    sender = await event.get_sender()
-                    name = sender.first_name if sender else "Unknown"
-                    await self.queue_manager.add_to_queue(event, service, name, self.client)
+                    # Extract the actual URL from the message
+                    url = service.extract_url(event.message.text)
+                    if url:
+                        logger.info(f"URL detected: {url} (Service: {service.name})")
+                        sender = await event.get_sender()
+                        name = sender.first_name if sender else "Unknown"
+                        await self.queue_manager.add_to_queue(event, service, url, name, self.client)
             except Exception as e:
                 logger.error(f"Error: {e}")
 
-        logger.info("Bot started! Send 'http://test.com/video' to trigger a test job.")
+        logger.info("Bot started! Send a YouTube link or 'http://test.com/video' to trigger a job.")
         # Do not await a non-awaitable run_until_disconnected() here.
         # The caller runs this synchronously after starting the coroutine.
         return
@@ -52,8 +57,4 @@ if __name__ == '__main__':
     # Start async setup (handlers, queue manager, etc.)
     bot.client.loop.run_until_complete(bot.start())
     # Block the thread until the client disconnects (synchronous)
-<<<<<<< HEAD
     bot.client.run_until_disconnected()
-=======
-    bot.client.run_until_disconnected()
->>>>>>> origin/main

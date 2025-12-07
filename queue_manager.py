@@ -26,6 +26,7 @@ class TaskStatus(Enum):
 class DownloadTask:
     event: Any
     service: Any
+    url: str
     sender_name: str
     client: Any
     added_at: datetime = field(default_factory=datetime.now)
@@ -66,8 +67,8 @@ class DownloadQueueManager:
         self._workers.clear()
         logger.info("Queue manager stopped")
     
-    async def add_to_queue(self, event, service, sender_name, client) -> None:
-        task = DownloadTask(event, service, sender_name, client)
+    async def add_to_queue(self, event, service, url, sender_name, client) -> None:
+        task = DownloadTask(event, service, url, sender_name, client)
         await self.queue.put(task)
         self.stats['total_queued'] += 1
         
