@@ -14,8 +14,7 @@ class MediaFixBot:
     def __init__(self):
         self.config = Config()
         # Connect to Telegram
-        self.client = TelegramClient('media_fix_bot', self.config.API_ID, self.config.API_HASH)
-        self.client.start(bot_token=self.config.BOT_TOKEN)
+        self.client = TelegramClient('media_fix_bot', int(self.config.API_ID or 0), str(self.config.API_HASH or ''))
         
         self.queue_manager = DownloadQueueManager(max_concurrent=2)
         self.service_factory = ServiceFactory()
