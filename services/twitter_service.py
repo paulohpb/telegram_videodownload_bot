@@ -246,12 +246,16 @@ class TwitterService:
                 file_size = os.path.getsize(output_path)
                 needs_comp = file_size > self.COMPRESSION_THRESHOLD_BYTES
 
+                # Move to a new temp file that persists after cleanup
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_dest:
+                    final_path = temp_dest.name
+                shutil.move(output_path, final_path)
+
                 if progress_tracker:
                     progress_tracker.update(stage=ProgressStage.PROCESSING, progress=100)
 
                 return {
-                    'file_path': output_path,
-                    'temp_dir': temp_dir,
+                    'file_path': final_path,
                     'title': meta['title'],
                     'duration': meta['duration'],
                     'file_size_mb': file_size / (1024 * 1024),
@@ -277,9 +281,8 @@ class TwitterService:
             return await loop.run_in_executor(
                 self._executor, self._download_sync, url, temp_dir, progress_tracker
             )
-        except Exception:
+        finally:
             self.cleanup(temp_dir)
-            raise
 
     def cleanup(self, temp_dir: str) -> None:
         if temp_dir and os.path.exists(temp_dir):

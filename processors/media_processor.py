@@ -1,21 +1,34 @@
 import os
 import asyncio
-from typing import Any, List, Optional
+from typing import Any
 from utils.logger import setup_logger
 from utils.video_compressor import VideoCompressor
 from utils.progress import ProgressTracker, ProgressStage, format_progress_message
+from utils.cache import get_cached_file_id, save_to_cache
 
 logger = setup_logger()
 
 class MediaProcessor:
-    def __init__(self, client: Any, queue_manager: Optional[Any] = None):
+    def __init__(self, client: Any, queue_manager: Any = None):
         self.client = client
         self.queue_manager = queue_manager
         self.compressor = VideoCompressor()
     
     async def process(self, task: Any, worker_id: int) -> None:
+        loop = asyncio.get_running_loop()
+        
+        # === 1. CACHE CHECK ===
+        cached_id = await loop.run_in_executor(None, get_cached_file_id, task.url)
+        
+        if cached_id:
+            logger.info(f"Cache HIT for {task.url}. Sending instantly.")
+            await task.event.reply(file=cached_id, caption=f"📹 **Video (Cached)**")
+            if self.queue_manager: self.queue_manager.update_status('completed', 1)
+            return
+
+        # === 2. STANDARD PROCESSING (Cache Miss) ===
         service = task.service
-        tracker = ProgressTracker(throttle_seconds=2.5) # Rate limit updates
+        tracker = ProgressTracker(throttle_seconds=2.5)
         processing_msg = None
         temp_files = []
         progress_task = None
@@ -23,42 +36,49 @@ class MediaProcessor:
         
         try:
             processing_msg = await task.event.reply("⏳ Starting...")
-            # Start background poller
             progress_task = asyncio.create_task(self._progress_updater(processing_msg, tracker, lambda: title))
             
-            # === DOWNLOAD ===
+            # --- DOWNLOAD ---
             self._update_status('downloading', 1)
             tracker.update(stage=ProgressStage.DOWNLOADING, progress=0)
+            
             result = await service.download(task.url, progress_tracker=tracker)
             self._update_status('downloading', -1)
             
             video_path = result['file_path']
             title = result.get('title', 'Video')
+            temp_files.append(video_path)
             
-            # === COMPRESS ===
+            # --- COMPRESS (Only if needed) ---
             final_path = video_path
-            if result.get('needs_compression'):
+            if result.get('needs_compression', False):
                 self._update_status('compressing', 1)
-                tracker.update(stage=ProgressStage.COMPRESSING, progress=0, eta="Calculating...")
+                tracker.update(stage=ProgressStage.COMPRESSING, progress=0)
                 
                 async def comp_cb(p): tracker.update(stage=ProgressStage.COMPRESSING, progress=p)
+                
                 final_path, was_comp = await self.compressor.compress_if_needed(video_path, progress_callback=comp_cb)
                 
                 if was_comp and final_path != video_path: temp_files.append(final_path)
                 self._update_status('compressing', -1)
             
-            # === UPLOAD ===
+            # --- UPLOAD & CACHE ---
             self._update_status('uploading', 1)
             tracker.update(stage=ProgressStage.UPLOADING, progress=0)
             
             def upload_cb(curr, tot):
                 if tot > 0: tracker.update(stage=ProgressStage.UPLOADING, progress=(curr/tot)*100)
 
-            await self.client.send_file(
+            msg = await self.client.send_file(
                 task.event.chat_id, final_path, 
                 caption=f"📹 **{title}**", 
                 progress_callback=upload_cb
             )
+            
+            if msg and msg.file and msg.file.id:
+                await loop.run_in_executor(None, save_to_cache, task.url, msg.file.id)
+                logger.info(f"Saved {task.url} to cache.")
+
             self._update_status('uploading', -1)
             tracker.set_completed()
 
@@ -67,28 +87,23 @@ class MediaProcessor:
             tracker.set_error(str(e))
             raise
         finally:
-            if progress_task: 
-                progress_task.cancel()
-                try: await progress_task
-                except asyncio.CancelledError: pass
-            
-            # Final UI update
+            if progress_task: progress_task.cancel()
             await self._safe_edit(processing_msg, format_progress_message(tracker.get_state(), title))
             if tracker.get_state().completed and processing_msg:
                 await processing_msg.delete()
 
-            # Cleanup
             for f in temp_files:
                 if os.path.exists(f): os.unlink(f)
-            if service and 'temp_dir' in locals():
-                service.cleanup(result['temp_dir'])
+            
+            # The service now handles its own cleanup
+            # if service and 'temp_dir' in locals() and result.get('temp_dir'):
+            #     service.cleanup(result.get('temp_dir'))
 
     async def _progress_updater(self, msg, tracker, get_title):
-        """Polls tracker state and edits message respecting rate limits."""
         last_text = ""
         try:
             while True:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.0)
                 state = tracker.get_state()
                 if state.completed or state.stage == ProgressStage.FAILED: break
                 

@@ -1,5 +1,4 @@
 import os
-import re
 import asyncio
 import tempfile
 import shutil
@@ -12,8 +11,6 @@ from utils.progress import ProgressTracker, ProgressStage
 logger = setup_logger()
 
 class YoutubeService:
-    """YouTube video download service using yt-dlp with async support.""" 
-    
     YOUTUBE_PATTERNS = [
         r'(https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+(?:[&?][\w=%-]*)*)',
         r'(https?://youtu\.be/[\w-]+(?:\?[\w=%-]*)*)',
@@ -26,57 +23,41 @@ class YoutubeService:
     def __init__(self, max_workers: int = 4, cookie_file: str = 'cookies.txt'):
         self.name = "YoutubeService" 
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
-        self._compiled_patterns = [re.compile(p) for p in self.YOUTUBE_PATTERNS]
         self.cookie_file = cookie_file if os.path.exists(cookie_file) else None 
-        if self.cookie_file: logger.info(f"Using cookie file: {self.cookie_file}")
-    
+
     def extract_url(self, text: str) -> Optional[str]:
         if not text: return None 
-        for pattern in self._compiled_patterns:
+        import re
+        for pattern in [re.compile(p) for p in self.YOUTUBE_PATTERNS]:
             match = pattern.search(text)
             if match: return match.group(1)
         return None 
-    
+
     def _download_sync(self, url: str, temp_dir: str, tracker: Optional[ProgressTracker] = None) -> Dict[str, Any]:
-        """Sync download with progress hooks.""" 
+        """Sync download with smart format selection.""" 
         
         def progress_hook(d: dict) -> None:
             if not tracker: return 
-            try:
-                status = d.get('status', '')
-                if status == 'downloading':
-                    total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
-                    downloaded = d.get('downloaded_bytes', 0)
-                    progress = (downloaded / total * 100) if total > 0 else 0
-                    
-                    # Parse Speed
-                    speed_str = ""
-                    speed = d.get('speed')
-                    if speed:
-                        speed_str = f"{speed/1024/1024:.1f} MB/s" if speed > 1024*1024 else f"{speed/1024:.1f} KB/s"
-                    
-                    # Parse ETA
-                    eta_str = ""
-                    eta = d.get('eta')
-                    if eta: eta_str = f"{eta}s"
+            if d['status'] == 'downloading':
+                p = d.get('_percent_str', '0%').replace('%','')
+                try: 
+                    tracker.update(stage=ProgressStage.DOWNLOADING, progress=float(p))
+                except: pass
 
-                    tracker.update(
-                        stage=ProgressStage.DOWNLOADING,
-                        progress=progress,
-                        speed=speed_str,
-                        eta=eta_str,
-                        filename=os.path.basename(d.get('filename', ''))
-                    )
-                elif status == 'finished':
-                    tracker.update(stage=ProgressStage.PROCESSING, progress=100, eta="Merging...")
-            except Exception as e:
-                logger.warning(f"Hook error: {e}")
+        # SMART FORMAT SELECTION: 
+        # 1. Try to find a video+audio combo under 50MB (filesize<50M)
+        # 2. Fallback to best quality (will require compression later)
+        format_str = (
+            'bestvideo[ext=mp4][filesize<50M]+bestaudio[ext=m4a]/'  # Best MP4 video < 50MB + audio
+            'best[ext=mp4][filesize<50M]/'                          # Best single file < 50MB
+            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'                # Fallback: Best quality (compress later)
+            'best[ext=mp4]/best'                                    # Fallback: Absolute best
+        )
 
-        ydl_opts: Dict[str, Any] = {
-            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        ydl_opts = {
+            'format': format_str,
             'merge_output_format': 'mp4',
-            'postprocessor_args': {'merger': ['-preset', 'fast']}, # Speed optimization
-            'outtmpl': os.path.join(temp_dir, '%(id)s_%(title)s.%(ext)s'),
+            'outtmpl': os.path.join(temp_dir, '%(id)s.%(ext)s'),
             'restrictfilenames': True,
             'progress_hooks': [progress_hook],
             'quiet': True, 'no_warnings': True, 'noplaylist': True,
@@ -85,28 +66,31 @@ class YoutubeService:
         if self.cookie_file: ydl_opts['cookiefile'] = self.cookie_file
         
         try:
-            # type: ignore 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl: # type: ignore
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore[arg-type]
                 if tracker: tracker.update(stage=ProgressStage.DOWNLOADING, progress=0, speed="Starting...")
                 info = ydl.extract_info(url, download=True)
                 
-                # Find file
                 mp4_files = [f for f in os.listdir(temp_dir) if f.endswith('.mp4')]
-                if not mp4_files: raise RuntimeError("No MP4 file found after download")
+                if not mp4_files: raise RuntimeError("No MP4 file found")
                 
                 downloaded_file = os.path.join(temp_dir, mp4_files[0])
                 file_size = os.path.getsize(downloaded_file)
+
+                # Move to a new temp file that persists after cleanup
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_dest:
+                    final_path = temp_dest.name
+                shutil.move(downloaded_file, final_path)
+                
+                # Check if compression is actually needed
                 needs_compression = file_size > self.COMPRESSION_THRESHOLD_BYTES
                 
                 return {
-                    'file_path': downloaded_file,
-                    'temp_dir': temp_dir,
+                    'file_path': final_path,
                     'title': info.get('title', 'Unknown'),
                     'duration': info.get('duration', 0),
                     'file_size_mb': file_size / (1024 * 1024),
-                    'needs_compression': needs_compression,
+                    'needs_compression': needs_compression, 
                     'uploader': info.get('uploader', ''),
-                    'ext': 'mp4',
                 }
         except Exception as e:
             if tracker: tracker.set_error(str(e))
@@ -117,9 +101,8 @@ class YoutubeService:
         temp_dir = tempfile.mkdtemp(prefix='yt_download_')
         try:
             return await loop.run_in_executor(self._executor, self._download_sync, url, temp_dir, progress_tracker)
-        except Exception:
+        finally:
             self.cleanup(temp_dir)
-            raise 
     
     def cleanup(self, temp_dir: str) -> None:
         if temp_dir and os.path.exists(temp_dir):

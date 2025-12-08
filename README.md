@@ -43,7 +43,17 @@ TELEGRAM_API_HASH=your_api_hash_here
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 ```
 
-### 5. Run the bot
+### 5. (Optional) Configure Cookies
+
+For downloading age-restricted or private content from sources like YouTube, you may need to provide browser cookies.
+
+1.  Create a file named `cookies.txt` in the root directory.
+2.  Install a browser extension that can export cookies in the Netscape format (e.g., "Get cookies.txt" for Chrome).
+3.  Export your cookies for the relevant sites (e.g., `youtube.com`) and paste the content into the `cookies.txt` file.
+
+The bot will automatically use this file if it exists.
+
+### 6. Run the bot
 ```bash
 python main.py
 ```

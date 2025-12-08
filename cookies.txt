@@ -1,0 +1,4 @@
+# This file is used to store cookies for downloading videos from sites like YouTube.
+# You can export your browser cookies for youtube.com and paste them here.
+# This is useful for downloading age-restricted or private videos.
+# The format is Netscape cookie format.
