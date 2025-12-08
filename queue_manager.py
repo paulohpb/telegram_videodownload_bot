@@ -32,6 +32,14 @@ class DownloadTask:
     added_at: datetime = field(default_factory=datetime.now)
     status: TaskStatus = TaskStatus.PENDING
     error: Optional[str] = None
+    
+    def __hash__(self) -> int:
+        """Hash by object id for use in sets."""
+        return id(self)
+    
+    def __eq__(self, other: Any) -> bool:
+        """Equality by object identity."""
+        return self is other
 
 
 class DownloadQueueManager:
