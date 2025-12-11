@@ -30,6 +30,7 @@ class MediaFixBot:
         @self.client.on(events.NewMessage(incoming=True))
         async def handle_message(event):
             try:
+                logger.info(f"Received message: {event.message.text}")
                 if not event.message.text: return
                 
                 service = self.service_factory.get_service_for_url(event.message.text)
@@ -40,6 +41,8 @@ class MediaFixBot:
                         sender = await event.get_sender()
                         name = sender.first_name if sender else "Unknown"
                         await self.queue_manager.add_to_queue(event, service, url, name, self.client)
+                    else:
+                        logger.warning(f"Service '{service.name}' was selected, but could not extract a valid URL from message: {event.message.text}")
             
             except ValueError as e:
                 logger.warning(f"Validation error: {e}")

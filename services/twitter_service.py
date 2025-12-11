@@ -11,6 +11,7 @@ from typing import Optional, Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
 
 import yt_dlp
+import aiohttp
 
 from utils.logger import setup_logger
 from utils.progress import ProgressTracker, ProgressStage
@@ -31,12 +32,12 @@ class TwitterService:
     
     # Combined patterns for Twitter and X
     TWITTER_PATTERNS = [
-        r'(https?://(?:www\\.)?twitter\\.com/[\\w]+/status/\\d+)',
-        r'(https?://(?:www\\.)?x\\.com/[\\w]+/status/\\d+)',
-        r'(https?://mobile\\.twitter\\.com/[\\w]+/status/\\d+)',
-        r'(https?://t\\.co/[\\w]+)',
-        r'(https?://(?:www\\.)?twitter\\.com/i/videos/\\d+)',
-        r'(https?://(?:www\\.)?x\\.com/i/videos/\\d+)',
+        r'(https?://(?:www\.)?twitter\.com/[\w/]+/status/\d+)',
+        r'(https?://(?:www\.)?x\.com/[\w/]+/status/\d+)',
+        r'(https?://mobile\.twitter\.com/[\w/]+/status/\d+)',
+        r'(https?://t\.co/[\w]+)',
+        r'(https?://(?:www\.)?twitter\.com/i/videos/\d+)',
+        r'(https?://(?:www\.)?x\.com/i/videos/\d+)',
     ]
     
     COMPRESSION_THRESHOLD_BYTES = 49 * 1024 * 1024
@@ -70,6 +71,38 @@ class TwitterService:
                 return url
         return None
 
+    async def _download_direct_aiohttp(
+        self, url: str, output_path: str, user_agent: str, progress_tracker: Optional[ProgressTracker]
+    ) -> bool:
+        """Download a file directly using aiohttp with progress."""
+        logger.info("Attempting Direct MP4 download via aiohttp...")
+        try:
+            headers = {'User-Agent': user_agent}
+            timeout = aiohttp.ClientTimeout(total=self.FFMPEG_TIMEOUT)
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        logger.warning(f"Aiohttp download failed with status: {response.status}")
+                        return False
+                    
+                    total_size = int(response.headers.get('content-length', 0))
+                    downloaded_size = 0
+                    
+                    with open(output_path, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(8192):
+                            f.write(chunk)
+                            downloaded_size += len(chunk)
+                            if progress_tracker and total_size > 0:
+                                progress = 10 + min(90.0, (downloaded_size / total_size) * 90)
+                                progress_tracker.update(stage=ProgressStage.DOWNLOADING, progress=progress)
+            
+            logger.info("Aiohttp download successful")
+            return True
+        except Exception as e:
+            logger.warning(f"Aiohttp download failed: {e}")
+            if os.path.exists(output_path): os.remove(output_path)
+            return False
+
     def _extract_metadata_sync(self, url: str, user_agent: str) -> Dict[str, Any]:
         """Use yt-dlp to get the m3u8 manifest and metadata without downloading."""
         ydl_opts = {
@@ -78,6 +111,7 @@ class TwitterService:
             'no_warnings': True,
             'noplaylist': True,
             'http_headers': {'User-Agent': user_agent},
+            'nocheckcertificate': True,
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
@@ -200,92 +234,87 @@ class TwitterService:
             if os.path.exists(output_path): os.remove(output_path)
             raise e
 
-    def _download_sync(self, url: str, temp_dir: str, progress_tracker: Optional[ProgressTracker] = None) -> Dict[str, Any]:
-        """Orchestrates the download process with fallbacks."""
-        last_error = None
-        
-        # Try primary UA then fallbacks
-        for user_agent in [self.USER_AGENT] + self.FALLBACK_USER_AGENTS:
-            try:
-                if progress_tracker:
-                    progress_tracker.update(stage=ProgressStage.DOWNLOADING, progress=5, speed="Extracting info...")
-
-                # 1. Get Metadata
-                meta = self._extract_metadata_sync(url, user_agent)
-                
-                safe_title = re.sub(r'[^\\w\\s-]', '', meta['title'])[:50].strip().replace(' ', '_')
-                output_path = os.path.join(temp_dir, f"{safe_title}_{meta['video_id']}.mp4")
-
-                # 2. Try Direct Download (Faster)
-                downloaded = False
-                if meta['direct_url']:
-                    try:
-                        logger.info("Attempting Direct MP4 download...")
-                        self._download_with_ffmpeg(
-                            meta['direct_url'], output_path, False, meta['duration'], user_agent, progress_tracker
-                        )
-                        downloaded = True
-                    except Exception as e:
-                        logger.warning(f"Direct download failed: {e}. Falling back to HLS.")
-
-                # 3. Fallback to HLS (More reliable)
-                if not downloaded and meta['m3u8_url']:
-                    logger.info("Downloading HLS stream...")
-                    self._download_with_ffmpeg(
-                        meta['m3u8_url'], output_path, True, meta['duration'], user_agent, progress_tracker
-                    )
-                    downloaded = True
-                
-                if not downloaded:
-                    raise RuntimeError("No valid video streams found.")
-
-                # 4. Finalize
-                if not os.path.exists(output_path) or os.path.getsize(output_path) < 10000:
-                    raise RuntimeError("File not created or empty")
-
-                file_size = os.path.getsize(output_path)
-                needs_comp = file_size > self.COMPRESSION_THRESHOLD_BYTES
-
-                # Move to a new temp file that persists after cleanup
-                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_dest:
-                    final_path = temp_dest.name
-                shutil.move(output_path, final_path)
-
-                if progress_tracker:
-                    progress_tracker.update(stage=ProgressStage.PROCESSING, progress=100)
-
-                return {
-                    'file_path': final_path,
-                    'title': meta['title'],
-                    'duration': meta['duration'],
-                    'file_size_mb': file_size / (1024 * 1024),
-                    'needs_compression': needs_comp,
-                    'uploader': meta['uploader'],
-                    'ext': 'mp4'
-                }
-
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Attempt failed with UA {user_agent}: {e}")
-                # Don't retry for fatal errors (e.g. 404)
-                if any(x in str(e).lower() for x in ['not found', 'private']): break
-        
-        if progress_tracker: progress_tracker.set_error(str(last_error))
-        raise RuntimeError(str(last_error))
-
     async def download(self, url: str, progress_tracker: Optional[ProgressTracker] = None) -> Dict[str, Any]:
-        """Async entry point."""
+        """Async entry point. Tries direct aiohttp download first, then falls back."""
         loop = asyncio.get_running_loop()
         temp_dir = tempfile.mkdtemp(prefix='twitter_dl_')
+        
         try:
-            return await loop.run_in_executor(
-                self._executor, self._download_sync, url, temp_dir, progress_tracker
-            )
+            # --- 1. Metadata Extraction ---
+            if progress_tracker:
+                progress_tracker.update(stage=ProgressStage.DOWNLOADING, progress=5, speed="Extracting info...")
+
+            last_error = None
+            meta = None
+            for user_agent in [self.USER_AGENT] + self.FALLBACK_USER_AGENTS:
+                try:
+                    logger.info(f"Attempting to extract metadata with user agent: {user_agent}")
+                    meta = await loop.run_in_executor(self._executor, self._extract_metadata_sync, url, user_agent)
+                    logger.info(f"Metadata extracted: {meta}")
+                    break 
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Metadata extraction failed with UA {user_agent}: {e}")
+                    if any(x in str(e).lower() for x in ['not found', 'private']): break
+            
+            if not meta:
+                raise RuntimeError(f"Failed to extract metadata after all attempts. Last error: {last_error}")
+
+            safe_title = re.sub(r'[^\w\s-]', '', meta['title'])[:50].strip().replace(' ', '_')
+            output_path = os.path.join(temp_dir, f"{safe_title}_{meta['video_id']}.mp4")
+
+            # --- 2. Direct Download Attempt ---
+            downloaded = False
+            if meta['direct_url']:
+                downloaded = await self._download_direct_aiohttp(
+                    meta['direct_url'], output_path, self.USER_AGENT, progress_tracker
+                )
+
+            # --- 3. FFmpeg HLS Fallback ---
+            if not downloaded:
+                logger.info("Direct download failed or unavailable, falling back to FFmpeg HLS.")
+                if not meta['m3u8_url']:
+                    raise RuntimeError("No m3u8 stream found for FFmpeg fallback.")
+
+                await loop.run_in_executor(
+                    self._executor, self._download_with_ffmpeg,
+                    meta['m3u8_url'], output_path, True, meta['duration'], self.USER_AGENT, progress_tracker
+                )
+            
+            # --- 4. Finalize ---
+            if not os.path.exists(output_path) or os.path.getsize(output_path) < 10000:
+                raise RuntimeError("File not created or empty after all download attempts.")
+
+            file_size = os.path.getsize(output_path)
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_dest:
+                final_path = temp_dest.name
+            shutil.move(output_path, final_path)
+
+            if progress_tracker:
+                progress_tracker.update(stage=ProgressStage.PROCESSING, progress=100)
+
+            logger.info(f"Download successful. Final path: {final_path}")
+            return {
+                'file_path': final_path,
+                'title': meta['title'],
+                'duration': meta['duration'],
+                'file_size_mb': file_size / (1024 * 1024),
+                'needs_compression': file_size > self.COMPRESSION_THRESHOLD_BYTES,
+                'uploader': meta['uploader'],
+                'ext': 'mp4'
+            }
+
+        except Exception as e:
+            if progress_tracker: progress_tracker.set_error(str(e))
+            logger.error(f"Download orchestration failed: {e}")
+            raise
         finally:
             self.cleanup(temp_dir)
 
+
     def cleanup(self, temp_dir: str) -> None:
         if temp_dir and os.path.exists(temp_dir):
+            logger.info(f"Cleaning up temporary directory: {temp_dir}")
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def shutdown(self) -> None:

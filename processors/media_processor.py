@@ -22,7 +22,12 @@ class MediaProcessor:
         
         if cached_id:
             logger.info(f"Cache HIT for {task.url}. Sending instantly.")
-            await task.event.reply(file=cached_id, caption=f"📹 **Video (Cached)**")
+            await self.client.send_file(
+                task.event.chat_id,
+                file=cached_id,
+                caption=f"📹 **Video (Cached)**",
+                reply_to=task.event.message
+            )
             if self.queue_manager: self.queue_manager.update_status('completed', 1)
             return
 
